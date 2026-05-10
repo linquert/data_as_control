@@ -100,6 +100,42 @@ Pretrain on cellular automata state transitions, formal language grammars with k
 ### How does loss landscape flatness correlate with internal circuit organization, and can curriculum design predictably target flatter minima?
 Curricula presenting varied compositions, multiple descriptions of the same scene, and interleaved structural parallels should push the optimizer toward flatter minima by preventing any single weight configuration from being necessary for a specific training example. Test this by measuring loss landscape sharpness at convergence for different curricula and correlating with OOD structural generalization, error taxonomy profiles, and internal circuit geometry — a direct link from data design to loss geometry to circuit organization.
 
+### What does a shortcut-forming update look like versus a shortcut-breaking update at
+the weight level, and do they involve the same matrices in opposite directions?
+
+The memorization → cleanup arc implies that shortcut circuits form early and dissolve
+later. But the weight-level mechanism of dissolution is underexplored. The hypothesis: a
+shortcut-forming update primarily changes W_V and MLP (the computation pathway, because
+the shortcut relies on a specific easy-to-extract feature), while a shortcut-breaking
+update primarily changes W_Q and W_K (the routing pathway, because breaking the shortcut
+requires redirecting attention away from the exploited feature toward the true
+dependencies).
+
+Testing this requires a two-phase curriculum: train first on data that supports a shortcut
+(e.g., smooth rows where center-cell persistence predicts correctly), then introduce data
+that makes the shortcut fail (balanced neighborhoods where center-only prediction is
+wrong). The matrix-level gradient norms — separately for W_Q, W_K, W_V, and MLP — before,
+during, and after the transition tell you which components are involved in each phase. If
+shortcut formation and dissolution involve different matrices, they are mechanistically
+asymmetric — not simply the forward and reverse of the same process.
+
+### Can the gradient direction of a single update predict its semantic effect before
+evaluating the model on held-out data?
+
+The gradient norm tells you how much each weight matrix changed. The gradient direction
+tells you what functional change the update pushed toward. For tasks with known optimal
+structure, you can define a "routing-aligned gradient": the gradient that would maximally
+increase attention mass on the true dependency offsets. Compute the cosine similarity
+between the actual gradient on W_Q/W_K and this routing-aligned gradient. A high
+similarity means this batch is correcting routing; a low similarity means the batch is
+acting on something else.
+
+This metric converts update classification from a post-hoc behavioral question — did the
+accuracy improve on held-out data after this update? — into a real-time signal computed
+during training. If the routing alignment score predicts subsequent accuracy improvements
+better than the loss itself, it reveals that the semantically meaningful structure of the
+gradient is not captured by the scalar loss at all.
+
 ---
 
 ## III. Circuits: Formation, Composition, Interaction, and Evolution
@@ -109,6 +145,44 @@ The circuit framing identifies circuits as subgraphs of the computation graph �
 
 ### How do circuits form — gradually or as phase transitions?
 The induction head literature shows that induction heads form suddenly at a specific point in training, correlated with a sudden improvement in in-context learning. The question is how general this is. Do all circuits form via phase transitions, or only the most algorithmic ones? For circuits implementing fuzzier capabilities — stylistic consistency, pragmatic inference — does the phase transition model still apply, or does it look more like a gradual accumulation?
+### When multiple circuits must form for a task, do they form sequentially in a
+predictable order, and does the order reveal their dependency structure?
+
+For tasks requiring several distinct sub-circuits, the circuit formation timeline —
+measuring each circuit's behavioral indicator separately over training — reveals the
+dependency order. Circuits that form first are either easier to learn (require less data,
+simpler computation) or are prerequisites for later circuits (the later circuit cannot
+form until its inputs are available).
+
+For a task with 8 distinguishable input patterns and known outputs (like a binary CA
+rule), the 8 per-pattern accuracy curves constitute a complete circuit formation timeline
+with no annotation required. For a majority rule, the patterns with unanimous neighbors
+(000→0, 111→1) should form first because they are learnable from center-cell statistics
+alone. The patterns where the minority bit wins should form later and only after the
+routing circuit has developed sufficiently to expose all three neighbors to the computation.
+For a parity rule, all 8 patterns are equally complex, so formation order should follow
+frequency rather than computational difficulty. Comparing these two rules directly tests
+whether the circuit formation order is determined by computational structure or by
+statistical exposure — two fundamentally different accounts of what drives circuit
+formation.
+
+### Does cross-circuit interference occur during formation, and is it visible as accuracy
+regression on previously-learned patterns when new patterns are introduced?
+
+When the model forms a new circuit to handle a previously rare pattern, the gradient from
+that pattern may interfere with existing circuits. Concretely: introducing many examples
+of pattern X into a batch that previously handled pattern Y well may cause accuracy on Y
+to drop temporarily. If this regression occurs, the two circuits share weight structure —
+they use overlapping directions in the weight space. If it does not occur, the circuits
+are orthogonal in their weight-space footprint.
+
+Tracking the full cross-pattern accuracy correlation matrix over training — how often does
+improving pattern X correlate with regressing pattern Y — reveals the interference
+topology of the forming circuits. A diagonal correlation matrix (each pattern's accuracy
+moves independently) indicates modular circuits. Off-diagonal correlations indicate shared
+structure. Negative off-diagonal entries indicate direct competition. This interference
+matrix is a map of circuit entanglement visible at the behavioral level, requiring no
+weight inspection.
 
 ### Do circuits compose hierarchically, and if so how?
 Does a higher-level circuit read a feature computed by a lower-level circuit via the residual stream, treating it as a subroutine? Or is it more continuous — does the higher circuit receive a superposition of many lower partial computations and recombine them in ways that cannot be cleanly decomposed? The former implies a modular architecture that emerges from training. The latter implies a more holographic computation that resists decomposition.
@@ -176,6 +250,59 @@ Within a transformer block, the attention sublayer and MLP sublayer interact thr
 
 ### When is intermediate computation — CoT, scratchpad, trace tokens — genuinely carrying causal state versus being decorative?
 Induction heads explain in-context learning for simple pattern completion. For richer reasoning, it is not known when intermediate text is genuinely carrying useful state versus changing the probability distribution over next tokens in a way that correlates with correct answers. Ablating specific scratchpad tokens and measuring whether specific downstream capabilities degrade proportionally is the test. A genuine working memory scratchpad should show specific degradation on the capability that depends on the ablated tokens. Decorative CoT should be robust to ablation or paraphrase.
+
+### Is the learned QK compatibility a function of relative position or absolute position,
+and can you test this without running any new data?
+
+For tasks with known dependency structure — cellular automata, sorting, graph traversal —
+you can extract QK scores using position embeddings alone, factoring out token content
+entirely:
+
+    score(i, j) = (W_Q @ pos_embed[i]) · (W_K @ pos_embed[j]) / sqrt(d_head)
+
+Plot this as a matrix over all (i, j) pairs. A model that learned relative-position
+routing produces a Toeplitz matrix — the score depends only on j-i, so each diagonal has
+constant values. A model that memorized absolute positions produces an arbitrary matrix
+with no diagonal structure. The degree of Toeplitz structure is a direct, zero-cost
+measurement of whether routing is relative or absolute, and it can be computed at any
+checkpoint without additional data. Models that fail to generalize to longer sequences
+should show lower Toeplitz structure than models that succeed — making this a training-
+time predictor of length generalization.
+
+### Do attention heads specialize to different dependency roles, and does this
+specialization emerge or drift over training?
+
+For a multi-head model on a task requiring three inputs (e.g., a left neighbor, center,
+and right neighbor in a CA rule), heads can either specialize — one head per input role —
+or attend redundantly to the same positions. These outcomes are qualitatively different
+failure modes: redundancy wastes capacity; specialization risks brittleness if one head
+fails.
+
+The diagnostic is cross-head KL divergence: how different are the attention distributions
+of two heads from each other, averaged over query positions and batch? Rising divergence
+means heads are differentiating into distinct roles. Flat near-zero divergence means
+redundancy or dominance (one head doing all the work). Tracking this over training answers
+a more subtle question: once specialization forms, does it persist stably, or do heads
+drift and reassign roles as training continues? Role drift after initial specialization
+would indicate the specialization was not locked in — it represents a fragile equilibrium
+rather than a stable circuit.
+
+### Can V payload failure and QK routing failure be dissociated, and what is the minimal
+experiment that separates them?
+
+A head may attend to the correct positions while still failing to extract the relevant
+information from them — the attention pattern is right but the value readout is wrong.
+This V payload failure is invisible in attention patterns alone and requires a probe on
+the value vectors themselves.
+
+The three-way dissociation to look for: high true-offset attention mass (routing correct)
++ low V bit-state probe accuracy (payload failing) + poor output accuracy. When this
+pattern holds, the bottleneck is definitively in W_V rather than in W_Q or W_K. The
+minimal separating experiment is forced-attention patching: replace the model's computed
+attention pattern with the theoretically correct one (point mass on the true dependency
+offsets), then measure whether output accuracy improves. If it does, the bottleneck was
+routing. If it does not despite correct attention, the bottleneck is downstream — either
+V payload or MLP computation — and the probe distinguishes between those.
 
 ---
 
@@ -252,6 +379,27 @@ Finding that a specific attention head activates during containment reasoning is
 
 ### How do you find the minimal faithful causal abstraction automatically, rather than by hand?
 Causal abstraction is the strongest current framework: an explanation is valid if it is a faithful higher-level causal model of the low-level computation. But in practice, finding the minimal faithful abstraction requires search over a space of possible abstractions, and for large models this search is intractable without guidance. Your controlled data structures this search: because you know the generator's algorithm, you know what the correct high-level causal model should be, and you can test faithfulness by checking whether interventions on the model's circuit match predictions made by the generator's algorithm. This is the clearest path to automatic causal abstraction for a specific family of tasks.
+
+### When is the behavioral ground truth sufficient to verify a causal claim, and when
+does it require internal intervention?
+
+For tasks with fully known computational structure, the behavioral ground truth is strong
+enough to make specific predictions about internal interventions before running them. If
+the model has learned a genuine routing circuit, then forcing the attention pattern to the
+theoretically correct one should improve accuracy. If accuracy does not improve, the
+bottleneck is downstream regardless of how correct the attention looks. This conditional
+prediction — intervention X should produce outcome Y if and only if circuit Z is the
+bottleneck — is what transforms a correlational observation (this head activates during
+this computation) into a causal claim (this head is causally responsible for this
+computation).
+
+The hierarchy of evidence, from weakest to strongest: (1) behavioral accuracy on
+structured OOD splits, (2) linear probe accuracy on internal representations, (3)
+improvement under forced-correct-input intervention, (4) degradation under targeted
+ablation, (5) accurate prediction of output change under novel input perturbations. Claims
+about circuit function are only as strong as the highest level of evidence provided.
+Controlled synthetic data makes levels 3 through 5 tractable because you know what "the
+correct input" and "a novel perturbation" mean with respect to the ground-truth algorithm.
 
 ---
 
