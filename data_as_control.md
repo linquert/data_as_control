@@ -62,6 +62,27 @@ For arithmetic trace generation, the error taxonomy looks like this:
 | Result correct, intermediate wrong | Backward-engineered rather than computed | Step-by-step algorithm circuit |
 | Correct up to K digits, wrong after | Partial algorithm, not compositional | Multi-step composition circuit |
 
+The behavioral delta vector is a sharper version of the error taxonomy timeline.
+Rather than measuring error type prevalences at each checkpoint, measure the *change* in
+each error type prevalence between two consecutive checkpoints — the vector:
+
+    Δ[error_type_k] = prevalence_after_update - prevalence_before_update
+
+This delta vector is the semantic fingerprint of a single training update. An update that
+decreases all error types proportionally corresponds to general improvement. An update
+that decreases only one error type — say, routing failures on rare neighborhoods — while
+leaving others unchanged is a localized, pattern-specific update. An update that decreases
+routing failures while increasing computation failures is a circuit-reorganization event:
+the model improved its attention structure at the cost of temporary disruption to the
+downstream computation.
+
+The delta vector also captures interference: when improving one error type causes
+regression in another. This is common early in training, when circuits compete for weight
+capacity. If improving containment errors increases attribute binding errors, the two
+circuits share weight structure. If they are independent, improvements do not interfere.
+Tracking the cross-error-type correlation matrix of delta vectors over training reveals
+whether circuits are developing modularly or entangled.
+
 When you plot each error type as a separate curve over training time, different curves fall to zero at different times. Each fall corresponds to a circuit forming. This is a **circuit formation timeline** — a map of when each capability emerged, derived entirely from behavioral outputs, with no weight inspection required.
 
 ---
@@ -129,16 +150,56 @@ Visit D → Queue: []
 
 The verifier checks each queue state. Errors in queue management vs. errors in traversal order correspond to different algorithmic sub-circuits.
 
-**Cellular automata traces.** A 1D cellular automaton (e.g., Rule 110) with N cells and T time steps. The model learns to predict the next state from the current state.
+**Cellular automata traces.** A 1D cellular automaton (e.g., Rule 110) with N cells and
+T time steps. The model learns to predict the next state from the current state.
 
-```
-t=0: 0 1 1 0 1 0 1 1
-t=1: 0 1 1 1 1 1 1 0
-t=2: 0 1 0 0 0 0 1 0
-```
+    t=0: 0 1 1 0 1 0 1 1
+    t=1: 0 1 1 1 1 1 1 0
+    t=2: 0 1 0 0 0 0 1 0
 
-What makes cellular automata particularly interesting is that you can derive exactly what the attention pattern *should* look like for a model that has learned the rule: each output cell should attend to exactly the three input cells that determine it (left, center, right). You can compare the model's actual learned attention against this theoretically optimal attention, and the divergence tells you whether the model learned the rule or a shortcut.
+What makes cellular automata particularly powerful as a dataset is that you can derive
+exactly what the attention pattern *should* look like for a model that has learned the
+rule: each output cell should attend to exactly the three input cells that determine it
+(left, center, right). This gives you not just a behavioral ground truth but an internal
+ground truth — a theoretically optimal circuit to compare against.
 
+The verifier decomposes errors into a three-part taxonomy mirroring the computational
+structure of the rule: routing failures (the model attends to the wrong cells), payload
+failures (the model attends to the right cells but does not extract the cell state
+cleanly), and computation failures (the model has correct local information but applies
+the wrong Boolean function). Each failure type leaves a distinct signature: routing
+failure shows up as low QK attention mass on the correct neighbor offsets; payload failure
+shows up as poor linear probe accuracy on value vectors despite correct attention;
+computation failure shows up as neighborhood-specific output errors with correct attention
+and value representations.
+
+For structured splits, CA is unusually productive:
+
+- *Interior-only training, boundary-position test.* Train on cells at positions 2 through
+  L-2, where every cell has three real neighbors. Test on positions 0 and L-1, where one
+  neighbor is a padded value. If the interior rule generalizes to boundary handling, a
+  single shared circuit exists. If not, boundary handling is a separate circuit that was
+  never built.
+
+- *Texture-invariant split.* Train on rows with at most 2 state transitions (smooth,
+  mostly-constant regions). Test on rows with 6 or more transitions. Both sets contain the
+  same 8 local neighborhoods, but their statistical character differs completely. Accuracy
+  drop on the high-transition test set reveals that the learned circuit is entangled with
+  row texture rather than computing the local rule independently.
+
+- *Minimum rare-neighborhood threshold.* Train with 99% smooth rows (dominated by 000 and
+  111 neighborhoods) and 1% of everything else. How many rare-neighborhood examples does
+  the model need before it correctly predicts their outputs? Vary the proportion from 0.1%
+  to 50% and plot the threshold curve. A model with an abstract rule should require far
+  fewer rare examples than a frequency-weighted pattern cache. The curve shape is itself
+  diagnostic: an abrupt transition at some threshold indicates rule formation; a smooth
+  improvement indicates probabilistic interpolation.
+
+- *Position-range split.* Train on cells at positions 4 through 12 of a 16-cell row. Test
+  on positions 0 through 3 and 13 through 15. This directly tests whether the local-rule
+  circuit is position-general or position-specific. A model that learned relative-offset
+  attention should generalize; one that memorized absolute cell positions should not.
+  
 **Formal languages.** A language defined by a grammar with known rules (e.g., a Dyck language of balanced brackets, or a language with alternating symbols). The model learns to produce valid strings or to classify strings as valid or invalid.
 
 ```
@@ -491,6 +552,26 @@ Train at Level 1 (implicit) and Level 4 (explicit measurements), separately, bot
 
 If explicit-loose beats implicit-tight, then the information content of explicit prompts compensates for the lack of geometric pressure from tight examples. If implicit-tight beats explicit-loose, then the gradient signal from geometric pressure is more important than the information signal from explicit measurements.
 
+### Update semantics × Curriculum order
+
+The same curriculum can be analyzed at two levels: what the model eventually learns
+(behavioral endpoint) and what each individual update did along the way (update
+trajectory). Two curricula can produce identical endpoints through completely different
+update trajectories — one via many small routing updates followed by computation updates,
+another via large computation updates that also incidentally improve routing.
+
+To distinguish these trajectories, compute for each update the gradient alignment with
+the theoretically correct routing update direction: the gradient of the true-offset
+attention margin with respect to the Q and K weight matrices. A high routing-alignment
+score means the update is primarily correcting where the model looks. A low score means
+the update is correcting downstream computation given wherever the model currently looks.
+
+Plotting routing alignment over training for different curricula reveals when each
+curriculum triggers routing correction versus computation correction. This turns curriculum
+comparison from a behavioral question (which curriculum reaches lower final error) into a
+mechanistic one (which curriculum produces a trajectory of update types consistent with
+building circuits in the right order).
+
 ### Complexity × Freedom
 
 Train at complexity Level 3 (two objects, geometric constraint) with range-constrained freedom. Test at complexity Level 5 (hierarchical constraints) with partially-free freedom. Did the model learn "how to satisfy a constraint between two objects" as a reusable subroutine that applies when there are more objects and more freedom?
@@ -594,6 +675,15 @@ When does a specific circuit form (error taxonomy timeline), what data causes it
 
 **About circuit composition:**
 Which circuits are prerequisites for others (ordering of error type falls), whether circuits compose modularly or entangled (disjoint vocabulary splits), and whether a circuit for one task transfers to a related task (cross-relation splits).
+
+**About update semantics:**
+Whether a single training update strengthened routing (attention to correct positions),
+payload extraction (correct information from attended positions), or local computation
+(correct function applied to extracted information); whether two updates with the same
+loss decrease had the same or different internal effects; and whether a given batch will
+produce a generalizing, memorizing, or shortcut-forming update — predictable in advance
+from batch composition and current internal state.
+
 
 **About generalization:**
 Whether a model learned a general rule or a specific pattern (structured OOD splits), what the minimum evidence for generalization is (threshold experiments), and whether the model's solution is in a flat or sharp loss minimum (curriculum comparison with sharpness measurement).
